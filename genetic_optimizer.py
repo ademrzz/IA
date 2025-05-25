@@ -710,11 +710,379 @@ class TimetableGeneticOptimizer:
     
     def export_solution(self, filepath: str):
         """Exporte la meilleure solution"""
-        if not self.best_individual:
-            logger.warning("Aucune solution à exporter")
-            return
+     
         
         solution_data = {
             'solution_summary': self.get_solution_summary(),
             'chromosome': self.best_individual.chromosome,
-            'fitness_
+            'fitness_history': self.fitness_history,
+            'parameters': {
+                'population_size': self.params.population_size,
+                'max_generations': self.params.max_generations,
+                'crossover_rate': self.params.crossover_rate,
+                'mutation_rate': self.params.mutation_rate
+            },
+            'seances_details': [
+                {
+                    'id': i,
+                    'codform': seance.codform,
+                    'codgroupe': seance.codgroupe,
+                    'type_seance': seance.type_seance.value,
+                    'placement': self.best_individual.chromosome.get(i, {})
+                }
+                for i, seance in enumerate(self.best_individual.seances)
+            ]
+        }
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(solution_data, f, indent=2, ensure_ascii=False)
+            logger.info(f"Solution exportée vers {filepath}")
+        except Exception as e:
+            logger.error(f"Erreur lors de l'export: {e}")
+    
+    def import_solution(self, filepath: str) -> bool:
+        """Importe une solution depuis un fichier"""
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                solution_data = json.load(f)
+            
+            # Reconstruction de l'individu
+            if 'chromosome' in solution_data and 'seances_details' in solution_data:
+                seances = []
+                for seance_data in solution_data['seances_details']:
+                    seance = Seance(
+                        codform=seance_data['codform'],
+                        codgroupe=seance_data['codgroupe'],
+                        type_seance=TypeSeance(seance_data['type_seance'])
+                    )
+                    seances.append(seance)
+                
+                individual = Individual(self.data_manager, seances)
+                individual.chromosome = solution_data['chromosome']
+                individual.is_evaluated = False
+                
+                # Évaluation
+                self.evaluator.evaluate(individual)
+                self.best_individual = individual
+                
+                logger.info(f"Solution importée avec fitness: {individual.get_fitness():.3f}")
+                return True
+            
+        except Exception as e:
+            logger.error(f"Erreur lors de l'import: {e}")
+            return False
+    
+    def adaptive_parameters(self):
+        """Ajuste les paramètres en fonction de la progression"""
+        if self.generation > 0 and self.generation % 20 == 0:
+            # Augmenter la mutation si stagnation
+            if self.stagnation_counter > 10:
+                self.params.mutation_rate = min(self.params.mutation_rate * 1.1, 0.3)
+                logger.info(f"Mutation rate augmenté à {self.params.mutation_rate:.3f}")
+            
+            # Diminuer la mutation si amélioration rapide
+            elif self.stagnation_counter < 5:
+                self.params.mutation_rate = max(self.params.mutation_rate * 0.9, 0.05)
+                logger.info(f"Mutation rate réduit à {self.params.mutation_rate:.3f}")
+
+
+# ========== FONCTIONS UTILITAIRES ==========
+
+def calculer_effectif_groupe(data_manager: DataManager, codgroupe: str) -> int:
+    """Calcule l'effectif d'un groupe"""
+    if codgroupe in data_manager.groupes:
+        return data_manager.groupes[codgroupe].effectif
+    
+    # Estimation basée sur le type de groupe
+    if 'G' in codgroupe:  # Groupe de TD
+        return 30
+    elif 'S' in codgroupe:  # Sous-groupe de TP
+        return 15
+    else:  # Section entière
+        return 60
+
+
+def generer_seances_depuis_modules(data_manager: DataManager, codsec: str) -> List[Seance]:
+    """Génère la liste des séances à partir des modules d'une section"""
+    seances = []
+    
+    if codsec not in data_manager.sections:
+        logger.warning(f"Section {codsec} non trouvée")
+        return seances
+    
+    section = data_manager.sections[codsec]
+    
+    # Pour chaque formation de la section
+    for codform in section.formations:
+        if codform not in data_manager.formations:
+            continue
+        
+        formation = data_manager.formations[codform]
+        
+        # Cours magistraux (pour toute la section)
+        if formation.vh_cours > 0:
+            nb_seances_cours = int(formation.vh_cours / 1.5)  # 1.5h par séance
+            for _ in range(nb_seances_cours):
+                seances.append(Seance(
+                    codform=codform,
+                    codgroupe=codsec,  # Toute la section
+                    type_seance=TypeSeance.COURS
+                ))
+        
+        # TD (par groupe)
+        if formation.vh_td > 0:
+            nb_seances_td = int(formation.vh_td / 1.5)
+            groupes_td = [g for g in data_manager.groupes.keys() 
+                         if g.startswith(codsec) and 'G' in g]
+            
+            for groupe in groupes_td:
+                for _ in range(nb_seances_td):
+                    seances.append(Seance(
+                        codform=codform,
+                        codgroupe=groupe,
+                        type_seance=TypeSeance.TD
+                    ))
+        
+        # TP (par sous-groupe)
+        if formation.vh_tp > 0:
+            nb_seances_tp = int(formation.vh_tp / 1.5)
+            groupes_tp = [g for g in data_manager.groupes.keys() 
+                         if g.startswith(codsec) and 'S' in g]
+            
+            for groupe in groupes_tp:
+                for _ in range(nb_seances_tp):
+                    seances.append(Seance(
+                        codform=codform,
+                        codgroupe=groupe,
+                        type_seance=TypeSeance.TP
+                    ))
+    
+    logger.info(f"Généré {len(seances)} séances pour la section {codsec}")
+    return seances
+
+
+def optimiser_section(data_manager: DataManager, scoring_model: ScoringNeuralNetwork,
+                     feature_extractor: FeatureExtractor, codsec: str,
+                     params: GeneticParameters = None) -> Dict:
+    """
+    Fonction principale pour optimiser l'emploi du temps d'une section
+    
+    Args:
+        data_manager: Gestionnaire des données
+        scoring_model: Modèle de scoring neural
+        feature_extractor: Extracteur de caractéristiques
+        codsec: Code de la section
+        params: Paramètres de l'algorithme génétique
+    
+    Returns:
+        Dictionnaire contenant la solution et les statistiques
+    """
+    logger.info(f"=== Optimisation de la section {codsec} ===")
+    
+    # Génération des séances
+    seances = generer_seances_depuis_modules(data_manager, codsec)
+    if not seances:
+        logger.error(f"Aucune séance générée pour la section {codsec}")
+        return {'success': False, 'error': 'Aucune séance à planifier'}
+    
+    # Création de l'optimiseur
+    optimizer = TimetableGeneticOptimizer(
+        data_manager, scoring_model, feature_extractor, params
+    )
+    
+    try:
+        # Optimisation
+        best_solution = optimizer.optimize(seances, max_time=300)  # 5 minutes max
+        
+        # Résultats
+        solution_summary = optimizer.get_solution_summary()
+        
+        # Conversion vers format emploi du temps
+        emploi_temps = convertir_vers_emploi_temps(best_solution, data_manager)
+        
+        return {
+            'success': True,
+            'section': codsec,
+            'emploi_temps': emploi_temps,
+            'solution_summary': solution_summary,
+            'nb_seances': len(seances),
+            'fitness_final': best_solution.get_fitness()
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de l'optimisation de {codsec}: {e}")
+        return {
+            'success': False,
+            'section': codsec,
+            'error': str(e)
+        }
+
+
+def convertir_vers_emploi_temps(individual: Individual, data_manager: DataManager) -> Dict:
+    """Convertit un individu en format emploi du temps exploitable"""
+    emploi_temps = {}
+    
+    for seance_id, placement in individual.chromosome.items():
+        seance = individual.seances[seance_id]
+        
+        # Clé unique pour chaque créneau
+        creneau_key = f"J{placement['jour']}_T{placement['tranche']}"
+        
+        if creneau_key not in emploi_temps:
+            emploi_temps[creneau_key] = []
+        
+        # Informations de la séance
+        seance_info = {
+            'codform': seance.codform,
+            'codgroupe': seance.codgroupe,
+            'type_seance': seance.type_seance.value,
+            'codloc': placement['codloc'],
+            'id_enseignant': placement['id_enseignant'],
+            'jour': placement['jour'],
+            'tranche': placement['tranche']
+        }
+        
+        # Ajout des informations enrichies
+        if seance.codform in data_manager.formations:
+            formation = data_manager.formations[seance.codform]
+            seance_info['nom_formation'] = formation.nom
+            seance_info['couleur'] = formation.couleur
+        
+        if placement['codloc'] in data_manager.locaux:
+            local = data_manager.locaux[placement['codloc']]
+            seance_info['nom_local'] = local.nom
+            seance_info['capacite_local'] = local.capacite
+        
+        if placement['id_enseignant'] in data_manager.enseignants:
+            enseignant = data_manager.enseignants[placement['id_enseignant']]
+            seance_info['nom_enseignant'] = f"{enseignant.nom} {enseignant.prenom}"
+        
+        emploi_temps[creneau_key].append(seance_info)
+    
+    return emploi_temps
+
+
+def detecter_ameliorations_possibles(individual: Individual, data_manager: DataManager) -> List[Dict]:
+    """Détecte les améliorations possibles dans un emploi du temps"""
+    ameliorations = []
+    
+    # Analyse des charges par jour
+    charge_enseignants = defaultdict(lambda: defaultdict(int))
+    charge_groupes = defaultdict(lambda: defaultdict(int))
+    
+    for seance_id, placement in individual.chromosome.items():
+        seance = individual.seances[seance_id]
+        
+        charge_enseignants[placement['id_enseignant']][placement['jour']] += 1
+        charge_groupes[seance.codgroupe][placement['jour']] += 1
+    
+    # Détection des surcharges
+    for id_ens, charges in charge_enseignants.items():
+        for jour, nb_seances in charges.items():
+            if nb_seances > 6:  # Plus de 6 séances par jour
+                ameliorations.append({
+                    'type': 'surcharge_enseignant',
+                    'id_enseignant': id_ens,
+                    'jour': jour,
+                    'nb_seances': nb_seances,
+                    'priorite': 'haute'
+                })
+    
+    for codgroupe, charges in charge_groupes.items():
+        for jour, nb_seances in charges.items():
+            if nb_seances > 5:  # Plus de 5 séances par jour pour un groupe
+                ameliorations.append({
+                    'type': 'surcharge_groupe',
+                    'codgroupe': codgroupe,
+                    'jour': jour,
+                    'nb_seances': nb_seances,
+                    'priorite': 'moyenne'
+                })
+    
+    # Détection des créneaux mal utilisés
+    creneaux_utilisation = defaultdict(int)
+    for placement in individual.chromosome.values():
+        key = (placement['jour'], placement['tranche'])
+        creneaux_utilisation[key] += 1
+    
+    # Créneaux sous-utilisés
+    for (jour, tranche), nb_seances in creneaux_utilisation.items():
+        if nb_seances < 2 and tranche in [1, 2, 3]:  # Créneaux principaux
+            ameliorations.append({
+                'type': 'sous_utilisation_creneau',
+                'jour': jour,
+                'tranche': tranche,
+                'nb_seances': nb_seances,
+                'priorite': 'basse'
+            })
+    
+    return sorted(ameliorations, key=lambda x: {'haute': 3, 'moyenne': 2, 'basse': 1}[x['priorite']], reverse=True)
+
+
+# ========== EXEMPLE D'UTILISATION ==========
+
+def exemple_optimisation_complete():
+    """Exemple d'utilisation complète du système"""
+    
+    # 1. Chargement des données
+    data_manager = DataManager()
+    data_manager.charger_donnees_exemple()
+    
+    # 2. Chargement des modèles IA
+    scoring_model = ScoringNeuralNetwork()
+    scoring_model.load_model("models/scoring_model.h5")
+    
+    feature_extractor = FeatureExtractor(data_manager)
+    
+    # 3. Configuration des paramètres
+    params = GeneticParameters(
+        population_size=30,
+        max_generations=50,
+        crossover_rate=0.8,
+        mutation_rate=0.15,
+        elite_size=3,
+        use_multiprocessing=True,
+        n_workers=4
+    )
+    
+    # 4. Optimisation pour plusieurs sections
+    sections_a_traiter = ['1CP1', '1CP2', '2CP1']
+    resultats = {}
+    
+    for codsec in sections_a_traiter:
+        print(f"\n--- Traitement de la section {codsec} ---")
+        
+        resultat = optimiser_section(
+            data_manager, scoring_model, feature_extractor, codsec, params
+        )
+        
+        resultats[codsec] = resultat
+        
+        if resultat['success']:
+            print(f"✓ Section {codsec} optimisée avec fitness: {resultat['fitness_final']:.3f}")
+            
+            # Analyse des améliorations possibles
+            if 'emploi_temps' in resultat:
+                # Reconstruction de l'individu pour l'analyse
+                # (simplified pour l'exemple)
+                print(f"  - {resultat['nb_seances']} séances planifiées")
+                print(f"  - Conflits détectés: {resultat['solution_summary'].get('conflicts', {})}")
+        else:
+            print(f"✗ Erreur pour {codsec}: {resultat['error']}")
+    
+    # 5. Export des résultats
+    timestamp = int(time.time())
+    for codsec, resultat in resultats.items():
+        if resultat['success']:
+            filename = f"solution_{codsec}_{timestamp}.json"
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(resultat, f, indent=2, ensure_ascii=False)
+    
+    print(f"\n=== Optimisation terminée pour {len(sections_a_traiter)} sections ===")
+    return resultats
+
+
+if __name__ == "__main__":
+    # Test du système
+    exemple_optimisation_complete()
